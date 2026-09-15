@@ -6,12 +6,14 @@ Sending requires GRAPH_TENANT_ID, GRAPH_CLIENT_ID, GRAPH_CLIENT_SECRET,
 GRAPH_SENDER_MAILBOX, and GRAPH_DIGEST_RECIPIENT to be set. If any are
 missing, the digest is still built and logged, just not sent.
 """
+import html
 import json
 import os
 import sqlite3
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import quote as urlquote
 
 import requests
 from tenacity import retry, stop_after_attempt, wait_random_exponential
@@ -135,10 +137,10 @@ def build_digest(features):
     rows = "\n".join(
         "<tr><td>{place}</td><td>{mag}</td><td>{time}</td>"
         "<td><a href='https://earthquake.usgs.gov/earthquakes/eventpage/{id}'>details</a></td></tr>".format(
-            place=f["properties"]["place"],
+            place=html.escape(f["properties"]["place"]),
             mag=f["properties"]["mag"],
             time=datetime.fromtimestamp(f["properties"]["time"] / 1000, tz=timezone.utc).isoformat(),
-            id=f["id"],
+            id=urlquote(f["id"], safe=""),
         )
         for f in notable
     )

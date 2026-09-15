@@ -1,0 +1,38 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "id": "us7000abcd",
+      "properties": {
+        "mag": 5.1,
+        "place": "10km SW of Somewhere",
+        "time": 1700000000000,
+        "updated": 1700000100000
+      },
+      "geometry": { "type": "Point", "coordinates": [-122.4, 37.7, 10.0] }
+    },
+    {
+      "type": "Feature",
+      "id": "us7000abce",
+      "properties": {
+        "mag": 3.2,
+        "place": "5km N of Elsewhere",
+        "time": 1700000200000,
+        "updated": 1700000300000
+      },
+      "geometry": { "type": "Point", "coordinates": [-121.9, 38.1, 5.0] }
+    },
+    {
+      "type": "Feature",
+      "id": "us7000abcf",
+      "properties": {
+        "mag": 4.9,
+        "place": "20km E of Nowhere",
+        "time": 1700000400000,
+        "updated": 1700000500000
+      },
+      "geometry": { "type": "Point", "coordinates": [-120.5, 39.0, 15.0] }
+    }
+  ]
+}

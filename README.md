@@ -86,7 +86,7 @@ natural schedule firing.
 |---|---|---|
 | Container Apps Environment (system-assigned) | `AcrPull` | one ACR |
 | Container Apps Job (system-assigned) | `Key Vault Secrets User` (read-only) | one Key Vault |
-| Graph app registration | `Mail.Send` (Application) | not yet scoped down — see below |
+| Graph app registration | `Mail.Send` (Application) | scoped to one mailbox — see below |
 
 `GRAPH_CLIENT_SECRET` is a Key Vault reference resolved at runtime by the
 job's own managed identity — never a plaintext value in Azure config, and
@@ -94,11 +94,14 @@ never in the image or git history. Setting the secret's value once required
 temporarily self-granting vault-scoped write access to my own account; the
 job's runtime identity only ever has read access.
 
-**Production consideration:** `Mail.Send` (Application permission) is
-tenant-wide by default — it can send as any mailbox, not just the one this
-pipeline uses. Scoping it to one mailbox via an Exchange
-`ApplicationAccessPolicy` is a standard mitigation, but it hasn't been set
-up or verified here. Also open: nobody but the deploying account currently
+**Mail.Send is scoped, not tenant-wide.** The app doesn't hold a
+tenant-wide Entra application grant for `Mail.Send` — no such grant exists.
+Instead, authorization is via Exchange Online RBAC for Applications, with
+an Application `Mail.Send` assignment whose resource scope is
+`AdminMailboxOnly`. Verified directly with
+`Test-ServicePrincipalAuthorization`: the intended `GRAPH_SENDER_MAILBOX`
+comes back `InScope=True`, and a different real mailbox in the tenant comes
+back `InScope=False`. Also open: nobody but the deploying account currently
 has permission to manage the job.
 
 ## Reliability
@@ -165,5 +168,4 @@ of silence.
   production.
 - Verify actual email delivery (not just "alert fired") as part of initial
   setup.
-- Scope the Graph app's `Mail.Send` down before relying on it.
 - Finish the 7-day unattended run before calling this done.

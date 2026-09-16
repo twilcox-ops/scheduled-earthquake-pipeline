@@ -127,13 +127,19 @@ def upsert_events(conn, features):
     return inserted, updated
 
 
-def build_digest(features):
-    """Notable-records HTML digest, or None if nothing meets the threshold.
-    The USGS event page link is derived from `id` -- it isn't a stored field.
+def build_digest(features, inserted, updated):
+    """Run-summary + notable-records HTML digest, or None if nothing meets
+    the threshold. The USGS event page link is derived from `id` -- it
+    isn't a stored field.
     """
     notable = [f for f in features if (f["properties"].get("mag") or 0) >= NOTABLE_MAGNITUDE]
     if not notable:
         return None
+    skipped = len(features) - inserted - updated
+    summary = (
+        f"<p>Run summary: {len(features)} fetched, {inserted} inserted, "
+        f"{updated} updated, {skipped} skipped.</p>"
+    )
     rows = "\n".join(
         "<tr><td>{place}</td><td>{mag}</td><td>{time}</td>"
         "<td><a href='https://earthquake.usgs.gov/earthquakes/eventpage/{id}'>details</a></td></tr>".format(
@@ -145,6 +151,7 @@ def build_digest(features):
         for f in notable
     )
     return (
+        f"{summary}"
         f"<h2>{len(notable)} notable earthquake(s) (M{NOTABLE_MAGNITUDE}+)</h2>"
         f"<table border='1'><tr><th>Place</th><th>Mag</th><th>Time (UTC)</th><th>Link</th></tr>{rows}</table>"
     )
@@ -203,7 +210,7 @@ def run():
         set_watermark(conn, int(start.timestamp() * 1000))
         conn.commit()
 
-        digest_html = build_digest(features)
+        digest_html = build_digest(features, inserted, updated)
         if digest_html:
             send_digest_email(digest_html)
 

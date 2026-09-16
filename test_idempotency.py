@@ -41,8 +41,9 @@ def test_digest_escapes_malicious_usgs_fields():
         "geometry": {"type": "Point", "coordinates": [-122.4, 37.7, 10.0]},
     }
 
-    html_out = build_digest([malicious_feature])
+    html_out = build_digest([malicious_feature], inserted=1, updated=0)
 
+    assert "Run summary: 1 fetched, 1 inserted, 0 updated, 0 skipped." in html_out
     assert "<script>" not in html_out, "raw <script> tag leaked into digest markup"
     assert "onerror=" not in html_out
     assert "&lt;script&gt;" in html_out, "place field was not HTML-escaped"

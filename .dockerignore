@@ -1,0 +1,12 @@
+.env
+.env.example
+.git
+.gitignore
+.pytest_cache
+**/__pycache__
+pipeline.db
+fixtures
+test_idempotency.py
+README.md
+Dockerfile
+.dockerignore

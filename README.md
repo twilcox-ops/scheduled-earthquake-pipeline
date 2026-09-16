@@ -1,11 +1,8 @@
 # Scheduled Earthquake Ingestion Pipeline
 
-A job that runs on a schedule in the cloud, pulls new/updated earthquakes from
-USGS's public feed, stores them idempotently, and emails a digest when
-something significant happens — with no human touching it between runs. This
-is the generic "poll a source, reconcile against what we have, tell a human
-what changed" pattern that most scheduled business automation is a variation
-of.
+A scheduled job that pulls new/updated earthquakes from USGS's public feed,
+stores them idempotently, and emails a digest when something significant
+happens — unattended, on a cron.
 
 ## What it does
 
@@ -16,9 +13,8 @@ of.
   magnitude 4.5+ earthquake.
 - Alerts separately if the job **stops running at all** — not just if it
   errors.
-- Logs one structured JSON line per run (records fetched, inserted, updated,
-  skipped, and duration), so "when did this start getting slower" is a log
-  query, not a guess.
+- Logs one structured JSON line per run (fetched/inserted/updated/skipped
+  counts, duration).
 
 ## Architecture
 
@@ -42,23 +38,10 @@ flowchart LR
     USGS -->|fetch new/updated events| JOB
     JOB <-->|/data/pipeline.db, SQLite| FILES
     JOB -->|reads secret via own managed identity| KV
-    JOB -->|sendMail, scoped to 1 mailbox| GRAPH --> MAIL
+    JOB -->|sendMail| GRAPH --> MAIL
     JOB -->|system + console logs| LOGS --> RULE
     RULE -->|fires on silence, common alert schema| AG --> ALERTMAIL
 ```
-
-Every component in this diagram is actually deployed — nothing here is
-aspirational.
-
-## Why a natural key, not autoincrement
-
-The `earthquakes` table is keyed on USGS's own event `id`
-(`us7000abcd`-style), not a generated autoincrement column. USGS guarantees
-that ID is stable and unique for the life of the event, which is what makes
-replays safe: re-running the same time window is a plain
-`INSERT ... ON CONFLICT(id) DO UPDATE`, not a dedup problem. An autoincrement
-key would make "did I already have this row" a query instead of a language
-feature.
 
 ## Schema
 
@@ -80,147 +63,80 @@ CREATE TABLE pipeline_state (
 );  -- one row: watermark_updated_ms
 ```
 
-`pipeline_state` holds the watermark — the timestamp of the last successful
-run. Every run fetches `updatedafter=<watermark>`, not "the last 24 hours,"
-so a skipped run doesn't silently lose data; the next run just catches up
-from where it actually left off.
+`id` is USGS's own event ID, not an autoincrement column — it's stable and
+unique for the life of the event, which is what makes reruns safe
+(`INSERT ... ON CONFLICT(id) DO UPDATE`, not a dedup problem). `pipeline_state`
+holds the watermark of the last successful run; every run fetches from
+there instead of "the last 24 hours," so a skipped run doesn't lose data.
 
-## Deployment & current status
+## Status
 
-Deployed to Azure Container Apps Jobs (`rg-earthquake-pipeline`, East US):
-ACR → Container Apps Environment (system-assigned identity, `AcrPull`-only
-on that one ACR) → Container Apps Job on a 12h cron, 1 replica, ingress
-disabled, 0.5 vCPU / 1 GiB, ~49 MB image.
+Deployed to Azure Container Apps Jobs (`rg-earthquake-pipeline`, East US) on
+a 12h cron, 1 replica. Manual verification runs succeed end to end — image
+pull, USGS fetch, SQLite upsert, watermark persistence, digest send, and the
+missed-run alert all confirmed working.
 
-**Verified working:** manual executions succeed end to end (image pull →
-container start → USGS fetch → SQLite upsert → watermark persisted → digest
-sent when notable), the database persists correctly across separate
-executions via the mounted Azure Files share, and the missed-run alert fires
-and delivers email.
-
-**Not yet complete:** the acceptance criterion of **7 consecutive days of
-unattended, cron-triggered operation is still pending** — every execution to
-date has been a manual verification run, not a natural schedule firing. The
-schedule (`0 */12 * * *`) is live and will start accumulating that record
-going forward.
+**Not yet complete:** 7 consecutive days of unattended, cron-triggered
+operation. Every execution so far has been a manual verification run, not a
+natural schedule firing.
 
 ## Security & permissions
 
-Every credential the job needs is scoped to exactly what it does, nothing
-more:
+| Identity | Role | Scope |
+|---|---|---|
+| Container Apps Environment (system-assigned) | `AcrPull` | one ACR |
+| Container Apps Job (system-assigned) | `Key Vault Secrets User` (read-only) | one Key Vault |
+| Graph app registration | `Mail.Send` (Application) | not yet scoped down — see below |
 
-| Identity | Role | Scope | Why |
-|---|---|---|---|
-| Container Apps Environment (system-assigned) | `AcrPull` | one ACR | Pull the job's image. Nothing else. |
-| Container Apps Job (system-assigned) | `Key Vault Secrets User` | one Key Vault | Read `GRAPH_CLIENT_SECRET` at startup. Can't manage the vault or any other resource. (Key Vault RBAC doesn't support per-secret scoping, so vault-scope is the narrowest available role — the vault holds only this one secret.) |
-| Graph app registration | `Mail.Send` (Application) | scoped via Exchange RBAC to one mailbox | Send the digest as that mailbox only — not as any user in the tenant, which is the default blast radius of an unscoped `Mail.Send` grant. |
+`GRAPH_CLIENT_SECRET` is a Key Vault reference resolved at runtime by the
+job's own managed identity — never a plaintext value in Azure config, and
+never in the image or git history. Setting the secret's value once required
+temporarily self-granting vault-scoped write access to my own account; the
+job's runtime identity only ever has read access.
 
-Setting up that Key Vault row needed one temporary widening: writing the
-secret's value requires vault-scoped *write* access, which my own account
-(Owner at subscription scope) doesn't get automatically under Key Vault's
-RBAC mode — so I self-granted `Key Vault Secrets Officer`, scoped to just
-that vault, to set it once. The job's own runtime identity only ever got
-`Key Vault Secrets User` (read-only) — it can fetch the secret, not change
-it.
+**Production consideration:** `Mail.Send` (Application permission) is
+tenant-wide by default — it can send as any mailbox, not just the one this
+pipeline uses. Scoping it to one mailbox via an Exchange
+`ApplicationAccessPolicy` is a standard mitigation, but it hasn't been set
+up or verified here. Also open: nobody but the deploying account currently
+has permission to manage the job.
 
-`GRAPH_CLIENT_SECRET` is never a plaintext value anywhere in Azure — the
-job's secret definition is a Key Vault reference
-(`keyVaultUrl` + `identity: system`), resolved at runtime. It also never
-touches the container image: the `Dockerfile` only copies `pipeline.py` and
-`requirements.txt`, and `.env` is git-ignored and has never been committed
-(`git log -p | grep -i "key|secret|password"` across the full history turns
-up only variable names and schema column names, never a value).
+## Reliability
 
-**Known open item:** currently only the deploying account has any RBAC on
-these resources — nobody else has been granted permission to start or manage
-the job. That's the safest possible default, but it's an explicit decision
-still pending, not an oversight.
+- **Transient USGS failures:** `tenacity` retries the fetch 3x with
+  exponential backoff + jitter — verified with a controlled test (mocked
+  failures, real decorated function).
+- **Killed mid-run:** all writes for a run commit in a single SQLite
+  transaction. Verified by `SIGKILL`ing a run before commit — database came
+  back unchanged and uncorrupted, and the next run recovered cleanly with no
+  duplicates.
+- **SQLite on Azure Files (SMB) needs `mountOptions: nobrl`** — SMB's
+  mandatory byte-range locking conflicts with SQLite's default locking
+  model and crashes the container on first write otherwise. Safe to disable
+  here since the job only ever runs one replica at a time.
+- **Missed-run alerting** is verified to actually deliver email, not just
+  fire — the Action Group's email receiver needed
+  `useCommonAlertSchema: true`; the legacy format silently failed to send
+  for this alert type.
+- **Blast radius:** reads a public API, writes only to its own database;
+  the only external side effect is sending an email.
 
-## Azure Files persistence, and why `nobrl` was required
+## Testing
 
-`/data/pipeline.db` lives on an Azure Files share (SMB), mounted read/write
-into the job. Azure Files over SMB enforces mandatory byte-range file
-locking; SQLite's default locking model expects POSIX/`fcntl`-style advisory
-locks. The two are incompatible — the very first write to the database
-(the schema's `CREATE TABLE IF NOT EXISTS`) failed to acquire a lock and the
-container crashed with exit code 1, before a replica even showed up in logs.
-This is a documented limitation, not a code bug: SQLite's own docs warn
-against network filesystems for exactly this reason, and it's shown up
-before in Container Apps specifically.
+- `test_idempotency.py` (committed): 5 repeated upserts leave row counts
+  unchanged; malicious USGS-sourced strings can't inject into the digest
+  HTML.
+- Retry/backoff and kill-recovery were verified with one-off scripts against
+  the real code, not yet promoted to the committed suite.
+- In Azure, a second run correctly resumed from the first run's persisted
+  watermark and produced no duplicate rows on an overlapping fetch.
 
-**Fix:** the volume is mounted with `mountOptions: nobrl`, which disables
-SMB's enforced byte-range locking. That's safe here specifically because the
-job runs one replica at a time (`parallelism: 1`) — there's no real
-concurrent-write scenario for the disabled locking to protect against.
+## Results
 
-## Missed-run monitoring
-
-A job that errors loudly is fine — the interesting failure is a job that
-quietly stops being scheduled. That's covered separately from application
-error handling:
-
-- **Scheduled Query Rule** (`alert-earthquake-pipeline-missed-run`) queries
-  Log Analytics every hour for a `Completed` execution of the job in the
-  trailing 12 hours (the schedule interval). Fires if there are zero.
-- **Action Group** sends email on fire.
-
-This was verified to *actually deliver*, not just exist: an initial live
-fire test produced a "Fired" alert with `isSuppressed: false` but no email
-arrived. Isolating the cause (ruling out spam filtering, Alert Processing
-Rules, and unsubscribe status via Azure's own troubleshooting checklist,
-then a native Action Group test-notification, which *did* arrive) narrowed
-it to the email receiver's `useCommonAlertSchema` setting — `false`
-(legacy format) silently failed for this alert type, `true` (common
-schema) delivered correctly. Confirmed with a disposable side-by-side test
-against both settings before applying the fix to the real Action Group, then
-one more live fire against the real, fixed configuration — email received.
-
-## Failure handling, recovery, and blast radius
-
-- **Transient API failures:** the USGS fetch is wrapped in `tenacity`
-  (3 attempts, exponential backoff with jitter). Verified with a controlled
-  test that mocked two `503`s followed by a success against the real
-  decorated function — confirmed exactly 3 attempts, real measured delays
-  between them, and a clean successful result afterward.
-- **Killed mid-run:** all of a run's writes (row upserts + watermark update)
-  happen in one SQLite transaction, committed once at the end. Verified with
-  a controlled test: a process was `SIGKILL`ed after writing but before
-  committing — the database came back with `PRAGMA integrity_check: ok` and
-  state byte-for-byte identical to before the run started, and a subsequent
-  run recovered cleanly with no duplicate or missing rows.
-- **Blast radius:** the pipeline only reads a public API and writes to its
-  own database. Its one external side effect is sending email, and that's
-  scoped to a single mailbox (see Security above). There is no delete/write
-  access to anything outside its own data.
-
-## Testing & verification evidence
-
-- `test_idempotency.py` (committed, run via `python test_idempotency.py`):
-  proves 5 repeated upserts of the same batch leave the row count unchanged,
-  and that malicious USGS-sourced strings (`<script>` in a place name, a
-  quote-breaking event ID) can't inject into the digest HTML.
-- Retry/backoff and kill-mid-run recovery were verified with one-off
-  controlled tests against the real code (not reimplemented logic) during
-  development — see above for what each proved. These aren't yet part of
-  the committed suite; promoting them to permanent regression tests is a
-  natural next step.
-- Live in Azure: a second manual run correctly read back the watermark
-  persisted by the first (rather than re-backfilling), and its upsert
-  counts (1 inserted, 2 updated, 0 skipped for a 3-record overlapping fetch)
-  confirm no duplicate rows are created on repeated real runs.
-
-## Results (honest numbers, not projected)
-
-- First production write to `/data/pipeline.db`: 590 records backfilled
-  from a 24-hour historical window in 1.9 seconds.
-  The following manual run, 2 minutes later, correctly processed only the
-  3 records that had changed since (in 0.4 seconds) — proof it's doing
-  incremental fetches, not full rescans.
-- Container image: ~49 MB.
-- Uptime/unattended-days and a real records/day rate aren't reported here on
-  purpose — see "Not yet complete" above. Numbers here are only from
-  verification runs, not production operation, and this section will be
-  updated once there's an honest week of unattended data.
+First production write: 590 records backfilled in 1.9s. The next run, 2
+minutes later, processed only the 3 changed records in 0.4s — confirming
+incremental fetches, not full rescans. Image size: ~49 MB. Uptime and
+records/day aren't reported yet — see "Not yet complete" above.
 
 ## Running locally
 
@@ -231,37 +147,23 @@ python pipeline.py          # one run
 python test_idempotency.py  # idempotency check
 ```
 
-## Running in Azure (shape of the deployment)
+## Running in Azure
 
-Roughly, in this order: build/push the image to ACR
-(`az acr build`) → create a Container Apps Environment with a
-system-assigned identity, grant it `AcrPull` on the ACR → register the Azure
-Files share with the environment → create the Container Apps Job from that
-image on a 12h cron, mount the file share at `/data` with
-`mountOptions: nobrl` → create a Key Vault, give the job's own
-system-assigned identity `Key Vault Secrets User` on it, store
-`GRAPH_CLIENT_SECRET` there, and point the job's secret at it via
-`keyVaultUrl` + `identity: system` → create an Action Group (email,
-`useCommonAlertSchema: true`) and a Scheduled Query Rule on the job's Log
-Analytics workspace that fires when 12 hours pass with zero `Completed`
-executions.
+Build/push to ACR → Container Apps Environment with a system-assigned
+identity granted `AcrPull` → Container Apps Job on a 12h cron, Azure Files
+mounted at `/data` with `mountOptions: nobrl` → Key Vault holding
+`GRAPH_CLIENT_SECRET`, read by the job's own managed identity → Action
+Group (email, common alert schema) + Scheduled Query Rule watching for 12h
+of silence.
 
-## What I'd do differently / production considerations
+## What I'd do differently
 
-- **SQLite on Azure Files is a workaround, not a solution.** `nobrl` fixes
-  the symptom; a managed database (Postgres, or even Azure Table Storage for
-  this data shape) would avoid the whole class of network-filesystem-locking
-  problems instead of disabling a safety mechanism to route around it.
-- **Infrastructure as code.** This was built via CLI/Portal iteration, which
-  is how the `nobrl` and common-alert-schema issues got found — the hard
-  way, in production, after the fact. Bicep/Terraform with a review step
-  would surface both in a plan diff before deployment.
-- **Test the alert's actual delivery during setup, not after.** "The alert
-  fired" and "the email arrived" turned out to be different questions here.
-  A one-time delivery smoke test belongs in initial setup, not
-  troubleshooting.
-- **CI/CD for the image build**, instead of manual `az acr build`.
-- **Decide who else gets job access** before calling this done — currently
-  only the deploying account has any permission on these resources.
-- **Finish the 7-day unattended run** before this is actually "done" against
-  its own acceptance criteria.
+- Use a managed database instead of SQLite-on-Azure-Files — `nobrl` works
+  around the locking conflict rather than avoiding it.
+- Infrastructure as code instead of CLI/Portal iteration — would have
+  caught the `nobrl` and alert-schema issues in review instead of in
+  production.
+- Verify actual email delivery (not just "alert fired") as part of initial
+  setup.
+- Scope the Graph app's `Mail.Send` down before relying on it.
+- Finish the 7-day unattended run before calling this done.
